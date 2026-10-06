@@ -263,7 +263,7 @@ internal class ViewReader(private val a: Activity) {
     }
 
     /** 「像个能滚动的列表」—— findList 和 [conversationNames] 共用一套，免得两处规则跑偏。 */
-    private fun looksLikeList(v: View): Boolean = v is AbsListView || v is ScrollView ||
+    internal fun looksLikeList(v: View): Boolean = v is AbsListView || v is ScrollView ||
         v.javaClass.name.contains("RecyclerView") ||
         v.javaClass.name.contains("ListView") ||
         v.javaClass.name.contains("ScrollView") ||
@@ -336,7 +336,7 @@ internal class ViewReader(private val a: Activity) {
     }
 
     /** 量一行的形状：最左边有没有方形头像、有没有时间角标、有几个带文字的控件。 */
-    private fun rowShape(row: View): RowShape {
+    internal fun rowShape(row: View): RowShape {
         var avatarSize = 0
         var timeMark = false
         var textCount = 0
@@ -363,7 +363,7 @@ internal class ViewReader(private val a: Activity) {
     }
 
     /** row 里面还套着另一个「像列表」的容器吗（外层 RecyclerView 包内层的典型形状）。 */
-    private fun holdsList(row: View): Boolean {
+    internal fun holdsList(row: View): Boolean {
         if (row !is ViewGroup) return false
         var found = false
         walk(row) { v ->
@@ -374,7 +374,7 @@ internal class ViewReader(private val a: Activity) {
     }
 
     /** 把一行里所有带文字的子视图收成候选，交给纯函数 [pickRowName] 挑。 */
-    private fun rowCandidates(row: View): List<NameCandidate> {
+    internal fun rowCandidates(row: View): List<NameCandidate> {
         val out = ArrayList<NameCandidate>()
         walk(row, includeInvisible = false) { v ->
             if (!v.isShown) return@walk
@@ -568,7 +568,7 @@ internal class ViewReader(private val a: Activity) {
      * 一起认成消息内容（比「认不出来」更糟，还会被当成对方说的话）。现在宁可就这一行返回「没找到」，
      * 回落成原来的 `[ATTACHMENT_TEXT]` 占位 —— 行为和装 OCR 之前一样。
      */
-    private fun scanImage(row: View, bubbleText: String?): ImgScan {
+    internal fun scanImage(row: View, bubbleText: String?): ImgScan {
         val rowW = if (row.width > 0) row.width else row.measuredWidth
         val rowH = if (row.height > 0) row.height else row.measuredHeight
         val minSide = dp(84)
@@ -1017,7 +1017,7 @@ internal class ViewReader(private val a: Activity) {
      *   读正文必须为 true：微信会把正文放在 INVISIBLE 的占位控件里。
      *   找输入框/列表时保持 false（只认真正显示的控件）。
      */
-    private fun walk(root: View, includeInvisible: Boolean = false, action: (View) -> Unit) {
+    internal fun walk(root: View, includeInvisible: Boolean = false, action: (View) -> Unit) {
         val stack = ArrayDeque<View>()
         stack.addLast(root)
         var visited = 0
