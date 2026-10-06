@@ -128,6 +128,7 @@ internal class Panel(private val a: Activity) {
     private var chatName = ""
     private var lastScreenFingerprint = ""
     private var contextRevision = ""
+    private var pendingRequestKey = ""
     /** 打开会话时顺手认出来的名字（给「白名单」页当候选）；白名单关着时一条都不收。 */
     private val seenChats = LinkedHashSet<String>()
     /** 上一次读会话列表的时间 / 已处理到哪个请求 / 上次回传过的那一批（免得每 2.6 秒重发）。 */
@@ -448,7 +449,6 @@ internal class Panel(private val a: Activity) {
         // History changes require a fresh parse; the final key excludes already visible records to avoid repeat calls.
         val revision = conversationDigest(
             observedName, settings, profile?.name.orEmpty(), profile?.relation.orEmpty(), profile?.note.orEmpty(),
-            conversationDigest(*profile?.msgs.orEmpty().map { roleObservationKey(observedName, it.fromMe, it.text) }.toTypedArray()),
             prefs?.getBoolean(Keys.SELF_STYLE_ON, false).toString(),
             if (prefs?.getBoolean(Keys.SELF_STYLE_ON, false) == true) prefs?.getString(Keys.SELF_SKILL, "").orEmpty() else "",
         )
@@ -464,7 +464,10 @@ internal class Panel(private val a: Activity) {
             hasResult = false
             showIdle()
         }
-        val fingerprint = conversationDigest(observedName, reader.fingerprint(list), revision)
+        val historyRevision = conversationDigest(*profile?.msgs.orEmpty().map {
+            roleObservationKey(observedName, it.fromMe, it.text)
+        }.toTypedArray())
+        val fingerprint = conversationDigest(observedName, reader.fingerprint(list), revision, historyRevision)
         if (!force && !ocr.takeDirty() && fingerprint == lastScreenFingerprint) {
             Trace.note("跳过", "会话、资料和这一屏未变，不重复读")
             return
@@ -578,15 +581,14 @@ internal class Panel(private val a: Activity) {
             showIdle()
             return
         }
-        if (busy) {
-            lastScreenFingerprint = "" // Revisit changed messages when the pending call finishes.
-            Trace.note("忙", "上一轮还在跑（模型还没回），这一轮不重复问")
-            return
-        }
-
         val roleContext = roleContextFor(chatName, msgs)
         val requestKey = conversationRequestKey(chatName, settings, roleContext, msgs)
         lastFingerprint = requestKey
+        if (busy) {
+            if (pendingRequestKey == requestKey) return
+            generation++
+            busy = false
+        }
         cache[requestKey]?.let {
             Trace.note("缓存", "这一屏之前问过，直接用缓存（不烧 token）")
             render(it, msgs, fromCache = true)
@@ -946,6 +948,7 @@ internal class Panel(private val a: Activity) {
 
     private fun ask(cfg: ConfigData, msgs: List<ChatMsg>, fingerprint: String, roleContext: String?) {
         busy = true
+        pendingRequestKey = fingerprint
         lastCallAt = System.currentTimeMillis()
         // 只记「几条 · 哪个会话 · 走哪条路」，**不记正文**
         Trace.note(
