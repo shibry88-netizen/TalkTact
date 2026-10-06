@@ -568,7 +568,7 @@ internal class ViewReader(private val a: Activity) {
      * 一起认成消息内容（比「认不出来」更糟，还会被当成对方说的话）。现在宁可就这一行返回「没找到」，
      * 回落成原来的 `[ATTACHMENT_TEXT]` 占位 —— 行为和装 OCR 之前一样。
      */
-    internal fun scanImage(row: View, bubbleText: String?): ImgScan {
+    private fun scanImage(row: View, bubbleText: String?): ImgScan {
         val rowW = if (row.width > 0) row.width else row.measuredWidth
         val rowH = if (row.height > 0) row.height else row.measuredHeight
         val minSide = dp(84)
