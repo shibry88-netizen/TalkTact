@@ -77,12 +77,6 @@ internal class ViewReader(private val a: Activity) {
         return best
     }
 
-    /** 会出现在同一带的临时/状态文案，不是会话名。 */
-    private val TITLE_NOISE = listOf(
-        "对方正在输入", "正在输入", "网络连接不可用", "未连接", "点击重连", "连接中",
-        "语音通话中", "视频通话中", "邀请你", "按住说话", "松开 结束",
-    )
-
     /**
      * 聊天页顶部那个标题 —— 也就是这个会话的名字，「角色」功能拿它当 key。
      *
@@ -117,22 +111,12 @@ internal class ViewReader(private val a: Activity) {
                 } else {
                     TextCapture.textOf(v)?.toString()?.trim().orEmpty()
                 }
-                if (t.isEmpty() || t.length > 32) return@walk
-                if (t in UI_WORDS || looksLikeViewDump(t)) return@walk
-                if (t in avoid) return@walk
-                if (TITLE_NOISE.any { t.startsWith(it) }) return@walk
-                if (v.width < dp(24) || v.height < dp(14)) return@walk
                 val loc = IntArray(2)
                 v.getLocationOnScreen(loc)
-                if (loc[1] < bandTop || loc[1] > bandBottom) return@walk
-                val off = abs((loc[0] + v.width / 2f) - screenW / 2f) / screenW.toFloat()
-                if (off > 0.16f) return@walk
-                // 居中是主判据；宽度和字号只用来打平手（标题通常比旁边的东西更大更宽）
-                // 自绘控件的 v 不是 TextView，没有 textSize，取不到就算 0
-                val textPx = (v as? TextView)?.textSize ?: 0f
-                val score = ((1f - off) * 1000).toInt() +
-                    v.width.coerceAtMost(screenW) / 20 +
-                    (textPx.coerceAtMost(dp(40).toFloat()) / 4f).toInt()
+                val score = chatTitleScore(
+                    TitleCandidateSpec(t, v.width, v.height, loc[0], loc[1], (v as? TextView)?.textSize ?: 0f),
+                    screenW, density, bandTop, bandBottom, avoid,
+                ) ?: return@walk
                 if (score > bestScore) {
                     bestScore = score
                     best = t
@@ -289,12 +273,9 @@ internal class ViewReader(private val a: Activity) {
             if (v.childCount < 3) return@walk
             if (!looksLikeList(v)) return@walk
             val h = v.height
-            if (h <= 0) return@walk
             val loc = IntArray(2)
             v.getLocationOnScreen(loc)
-            if (loc[1] + h <= 0 || loc[1] >= height) return@walk
-            // 会话列表占小半个屏幕以上；太矮的多半是底部 tab 栏或某个折叠区
-            if (h < height * 0.25f) return@walk
+            if (!isConversationListContainer(v.isShown, v.childCount, true, h, loc[1], height)) return@walk
             lists.add(v)
         }
         if (lists.isEmpty()) return emptyList<String>() to "没找到像「会话列表」的容器"
@@ -340,14 +321,13 @@ internal class ViewReader(private val a: Activity) {
         var avatarSize = 0
         var timeMark = false
         var textCount = 0
-        val leftLimit = width * 0.30f
         walk(row) { v ->
             if (!v.isShown) return@walk
             if (v is ImageView) {
                 val w = if (v.width > 0) v.width else v.measuredWidth
                 val h = if (v.height > 0) v.height else v.measuredHeight
                 // 方形 + 正常头像尺寸 + 贴左边 —— 会话行就是这么摆的
-                if (w in dp(24)..dp(84) && h > 0 && abs(w - h) <= dp(4) && leftOf(v) < leftLimit) {
+                if (isConversationAvatar(w, h, leftOf(v), width, density)) {
                     if (w > avatarSize) avatarSize = w
                 }
                 return@walk
@@ -807,21 +787,6 @@ internal class ViewReader(private val a: Activity) {
         s.length in 2..400 && s !in UI_WORDS && !looksLikeViewDump(s)
 
     /**
-     * 形如 `a.b.C` 或 `a.b.C{...}` 的串一律不是聊天内容。
-     * 要求末段首字母大写，免得误伤 `www.baidu.com` 这种正常文本。
-     */
-    private fun looksLikeViewDump(s: String): Boolean {
-        val t = s.trim()
-        if (t.isEmpty()) return false
-        if (FQN_RE.matches(t)) return true
-        // "android.widget.LinearLayout{...}" 这种：去掉 {...} 之后再看一眼前半段
-        val head = t.substringBefore('{').trim()
-        if (head.length < t.length && head.length >= 8 && FQN_RE.matches(head)) return true
-        // 兜底：框架包名开头的一律不是聊天内容
-        return FRAMEWORK_PREFIXES.any { t.startsWith(it) }
-    }
-
-    /**
      * 认不出气泡容器时的兜底：
      * 先取最长的非噪音文字，再退到无障碍描述，最后才是「有头像的行 = 图片/表情」。
      */
@@ -957,7 +922,7 @@ internal class ViewReader(private val a: Activity) {
                             bg.javaClass.name.contains("Bubble", ignoreCase = true) ||
                             colorDistance(px, pageBg) > 20
                         if (looksLikeBubble) {
-                            hit = BubbleHit(classify(px), centerX(c).toDouble() / width.coerceAtLeast(1), ratio)
+                            hit = BubbleHit(classifyBubbleColor(px), centerX(c).toDouble() / width.coerceAtLeast(1), ratio)
                             break
                         }
                     }
@@ -980,21 +945,6 @@ internal class ViewReader(private val a: Activity) {
         scratch.getPixel(32, 32)
     } catch (t: Throwable) {
         0
-    }
-
-    private fun classify(px: Int): Side {
-        if (((px ushr 24) and 0xFF) < 24) return Side.UNKNOWN
-        val r = (px shr 16) and 0xFF
-        val g = (px shr 8) and 0xFF
-        val b = px and 0xFF
-        return if (g - r > 16 && g - b > 10) Side.ME else Side.OTHER
-    }
-
-    private fun colorDistance(a: Int, b: Int): Int {
-        val dr = abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF))
-        val dg = abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF))
-        val db = abs((a and 0xFF) - (b and 0xFF))
-        return dr + dg + db
     }
 
     private fun detectPageBackground(): Int {
@@ -1083,24 +1033,5 @@ internal class ViewReader(private val a: Activity) {
             "getHint",
         )
 
-        /**
-         * `android.widget.TextView` 这种：全是点分标识符、末段首字母大写。
-         * 刻意不把 `$` 写进字符类 —— 在 Kotlin 字符串里它是模板起始符，容易出幺蛾子，
-         * 而带 `$` 的内部类名字符串还有 FRAMEWORK_PREFIXES 那条兜底。
-         */
-        // matches() 本身就是整串匹配，不用 ^ / $ 锚点（也避开 Kotlin 字符串里的 $ 模板歧义）
-        val FQN_RE = Regex("([A-Za-z_][A-Za-z0-9_]*\\.)+[A-Z][A-Za-z0-9_]*")
-
-        /** 这些包名开头的一律不是聊天内容。 */
-        val FRAMEWORK_PREFIXES = listOf(
-            "android.", "androidx.", "java.", "javax.", "kotlin.", "dalvik.",
-            "com.tencent.", "com.android.", "com.google.android.",
-        )
-
-        /** 纯 UI 文案的无障碍描述，不当消息正文。 */
-        val UI_WORDS = setOf(
-            "头像", "表情", "更多功能", "更多", "返回", "发送", "语音输入", "加号",
-            "图片", "视频", "按住 说话", "切换键盘", "菜单", "关闭", "搜索", "聊天信息",
-        )
     }
 }
