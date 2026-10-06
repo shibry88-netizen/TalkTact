@@ -445,9 +445,10 @@ internal class Panel(private val a: Activity) {
         val profile = runCatching {
             Roles.decode(prefs?.getString(Keys.ROLES, "").orEmpty()).firstOrNull { it.key == observedName }
         }.getOrNull()
-        // History is compared in the final request key; automatic recording must not trigger another call.
+        // History changes require a fresh parse; the final key excludes already visible records to avoid repeat calls.
         val revision = conversationDigest(
             observedName, settings, profile?.name.orEmpty(), profile?.relation.orEmpty(), profile?.note.orEmpty(),
+            conversationDigest(*profile?.msgs.orEmpty().map { roleObservationKey(observedName, it.fromMe, it.text) }.toTypedArray()),
             prefs?.getBoolean(Keys.SELF_STYLE_ON, false).toString(),
             if (prefs?.getBoolean(Keys.SELF_STYLE_ON, false) == true) prefs?.getString(Keys.SELF_SKILL, "").orEmpty() else "",
         )
