@@ -126,7 +126,8 @@ internal class Panel(private val a: Activity) {
     /** 「白名单开着但认不出这个会话的名字」只提示一次，免得每屏都弹。 */
     private var whitelistNameNotified = false
     private var chatName = ""
-    private var chatNameFor = ""
+    private var lastScreenFingerprint = ""
+    private var contextRevision = ""
     /** 打开会话时顺手认出来的名字（给「白名单」页当候选）；白名单关着时一条都不收。 */
     private val seenChats = LinkedHashSet<String>()
     /** 上一次读会话列表的时间 / 已处理到哪个请求 / 上次回传过的那一批（免得每 2.6 秒重发）。 */
@@ -188,6 +189,9 @@ internal class Panel(private val a: Activity) {
             return
         }
         running = true
+        lastScreenFingerprint = ""
+        inputRef = null
+        listRef = null
         handler.removeCallbacks(ticker)
         handler.postDelayed(ticker, 400L)
     }
@@ -428,16 +432,44 @@ internal class Panel(private val a: Activity) {
         }
         noListTicks = 0
 
-        val fingerprint = reader.fingerprint(list)
-        // 识图是在后台认的：认完的时候这一屏一个字都没变，但可用的内容变了 ——
-        // 所以「刚认完」也要放行一次（takeDirty 取一次就清）。
-        if (!force && !ocr.takeDirty() && fingerprint == lastFingerprint) {
-            // 正常聊天时绝大多数轮都走这儿 —— 靠「连续相同合并计数」才没把缓冲刷满
-            Trace.note("跳过", "这一屏和上一轮一模一样，不重复读")
+        // A reused Activity can host different conversations with identical last messages.
+        // Resolve the title before every content fast-path; a missing title never inherits the old name.
+        val observedName = Roles.normalizeKey(reader.findChatTitle(decor, list).orEmpty())
+        val settings = conversationDigest(
+            cfg.prompt, cfg.model, cfg.baseUrl, cfg.apiKey, cfg.model2, cfg.baseUrl2, cfg.apiKey2,
+            cfg.graded.toString(), cfg.temperature.toString(), cfg.maxTokens.toString(),
+            cfg.jsonMode.toString(), cfg.ctx.toString(), cfg.allowSensitive.toString(),
+            cfg.whitelistEnabled.toString(), cfg.whitelist.sorted().toString(),
+            cfg.proxyEnabled.toString(), cfg.proxyPort.toString(), cfg.proxyToken,
+        )
+        val profile = runCatching {
+            Roles.decode(prefs?.getString(Keys.ROLES, "").orEmpty()).firstOrNull { it.key == observedName }
+        }.getOrNull()
+        // History is compared in the final request key; automatic recording must not trigger another call.
+        val revision = conversationDigest(
+            observedName, settings, profile?.name.orEmpty(), profile?.relation.orEmpty(), profile?.note.orEmpty(),
+            prefs?.getBoolean(Keys.SELF_STYLE_ON, false).toString(),
+            if (prefs?.getBoolean(Keys.SELF_STYLE_ON, false) == true) prefs?.getString(Keys.SELF_SKILL, "").orEmpty() else "",
+        )
+        if (revision != contextRevision) {
+            generation++ // Discard replies and rewrites started for the previous conversation or profile.
+            busy = false
+            contextRevision = revision
+            chatName = observedName
+            lastScreenFingerprint = ""
+            lastFingerprint = ""
+            lastCallAt = 0L
+            skipSensitiveFor = ""
+            hasResult = false
+            showIdle()
+        }
+        val fingerprint = conversationDigest(observedName, reader.fingerprint(list), revision)
+        if (!force && !ocr.takeDirty() && fingerprint == lastScreenFingerprint) {
+            Trace.note("跳过", "会话、资料和这一屏未变，不重复读")
             return
         }
         force = false
-        lastFingerprint = fingerprint
+        lastScreenFingerprint = fingerprint
 
         val rows = reader.snapshot(list)
         // 图片先排进后台去认（这一步不阻塞）。还有图没认完就这一轮先不分析 ——
@@ -496,7 +528,7 @@ internal class Panel(private val a: Activity) {
         emptyNotified = false
 
         // 记进「角色」页（认不出会话名就整页跳过，宁可漏记也不记错人）
-        recordToRoles(decor, list, msgs, fingerprint)
+        recordToRoles(decor, list, msgs)
 
         // 白名单：没勾的会话「彻底关闭」。位置放在 recordToRoles **之后** ——
         // 只有跑完它，这一屏的 chatName 才是刚认出来的（不然第一帧用的还是上一个聊天的名字）。
@@ -546,18 +578,22 @@ internal class Panel(private val a: Activity) {
             return
         }
         if (busy) {
+            lastScreenFingerprint = "" // Revisit changed messages when the pending call finishes.
             Trace.note("忙", "上一轮还在跑（模型还没回），这一轮不重复问")
             return
         }
 
-        cache[fingerprint]?.let {
+        val roleContext = roleContextFor(chatName, msgs)
+        val requestKey = conversationRequestKey(chatName, settings, roleContext, msgs)
+        lastFingerprint = requestKey
+        cache[requestKey]?.let {
             Trace.note("缓存", "这一屏之前问过，直接用缓存（不烧 token）")
             render(it, msgs, fromCache = true)
             return
         }
 
         val joined = msgs.joinToString("\n") { it.text }
-        val hits = if (cfg.allowSensitive || fingerprint == skipSensitiveFor) emptyList() else Sensitive.hits(joined)
+        val hits = if (cfg.allowSensitive || requestKey == skipSensitiveFor) emptyList() else Sensitive.hits(joined)
         if (hits.isNotEmpty()) {
             Trace.note("敏感", "命中敏感词：${hits.joinToString("、")} → 只提示，不外发")
             renderSensitive(hits)
@@ -565,13 +601,14 @@ internal class Panel(private val a: Activity) {
         }
 
         if (System.currentTimeMillis() - lastCallAt < cfg.minIntervalSec * 1000L) {
+            lastScreenFingerprint = "" // A throttled screen has not been analyzed yet.
             Trace.note("间隔", "距上次调用不到 ${cfg.minIntervalSec}s（设置里可调小）→ 只在按钮上留倒计时")
             // 不弹卡片打断聊天，只在按钮上留个倒计时（「设置」里可以把这个间隔调小）
             val left = (cfg.minIntervalSec * 1000L - (System.currentTimeMillis() - lastCallAt) + 999L) / 1000L
             setChip("$left s 后可再识别")
             return
         }
-        ask(cfg, msgs, fingerprint, roleContextFor(chatName, msgs))
+        ask(cfg, msgs, requestKey, roleContext)
     }
 
     /**
@@ -673,30 +710,15 @@ internal class Panel(private val a: Activity) {
         }
     }
 
-    private fun recordToRoles(decor: View, list: ViewGroup, msgs: List<ChatMsg>, fingerprint: String) {
+    private fun recordToRoles(decor: View, list: ViewGroup, msgs: List<ChatMsg>) {
         try {
-            if (chatNameFor != fingerprint) {
-                // 把消息列表和当前消息文本一起传进去：列表里的文字、以及和消息一模一样的文字，
-                // 都不可能是会话名（消息列表是从 y=0 铺满整屏的，会穿过工具栏那一带）
-                chatName = Roles.normalizeKey(
-                    reader.findChatTitle(decor, list, msgs.map { it.text }).orEmpty(),
-                )
-                chatNameFor = fingerprint
-                if (chatName.isBlank()) {
-                    // 认不出来就整页跳过（宁可漏记也不能记错人），但必须留证据 ——
-                    // 否则「为什么这个聊天页一条记录都没有」永远查不出来。
-                    dumpDiagnosis(
-                        decor, list, null,
-                        "认不出会话名，这一页不记录",
-                        extra = reader.describeTitleCandidates(decor, list),
-                    )
-                } else {
-                    rememberChatName(chatName)
-                }
-                // 白名单没勾这个会话 → 「彻底关闭」：这一页连记录都不做。
-                val c = config
-                if (c != null && blockedByWhitelist(c)) return
+            if (chatName.isBlank()) {
+                dumpDiagnosis(decor, list, null, "认不出会话名，这一页不记录", extra = reader.describeTitleCandidates(decor, list))
+            } else {
+                rememberChatName(chatName)
             }
+            val c = config
+            if (c != null && blockedByWhitelist(c)) return
             val now = System.currentTimeMillis()
             if (sentMsgs.size > 400) sentMsgs.clear()
             val fresh = ArrayList<Pair<String, RoleMsg>>()
@@ -716,7 +738,7 @@ internal class Panel(private val a: Activity) {
             if (chatName.isNotBlank()) {
                 for (m in msgs) {
                     if (m.attachment || m.text.isBlank()) continue
-                    if (!sentMsgs.add((if (m.fromMe) "1" else "0") + "|" + m.text)) continue
+                    if (!sentMsgs.add(roleObservationKey(chatName, m.fromMe, m.text))) continue
                     fresh.add(chatName to RoleMsg(m.fromMe, m.text, now))
                 }
             }
@@ -1046,6 +1068,7 @@ internal class Panel(private val a: Activity) {
         if (busy) return
         opts.visibility = View.GONE
         val gen = generation
+        val requestKey = lastFingerprint
         val original = reply.text
         body.text = "$head｜改写中…"
         busy = true
@@ -1064,14 +1087,14 @@ internal class Panel(private val a: Activity) {
             val failure = err
             handler.post {
                 runCatching {
-                    busy = false
                     if (gen != generation) return@runCatching
+                    busy = false
                     if (done != null) {
                         body.text = "$head｜$done"
-                        val cur = cache[lastFingerprint] ?: shown
+                        val cur = cache[requestKey] ?: shown
                         val list = cur.replies.toMutableList()
                         if (index in list.indices) list[index] = list[index].copy(text = done)
-                        cache[lastFingerprint] = cur.copy(replies = list)
+                        cache[requestKey] = cur.copy(replies = list)
                         if (used > 0) Heartbeat.send(a, used)
                     } else {
                         body.text = "$head｜$original"
