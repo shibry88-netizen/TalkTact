@@ -619,15 +619,19 @@ internal class ViewReader(private val a: Activity) {
         // 方形小图 = 头像 / 表情包那一类（和认头像同一套容差）。拿它们去 OCR 纯属白认。
         fun looksSquareSmall(h: ImgHit): Boolean = abs(h.w - h.h) <= dp(4) && minOf(h.w, h.h) <= minSide
 
-        val hit = hits.filter { it.big && it.view !is ViewGroup }.maxByOrNull { it.w * it.h }
-            ?: hits.filter { it.big && it.view !== row }.maxByOrNull { it.depth * 10_000_000 + it.w * it.h }
-            // 兜底档（第 21 版收紧）：排除头像 / 表情那种方形小图，且短边至少 48dp ——
-            // 把语音波形、小图标这类噪声挡在外面。原来还有一档「连整行都收」，已删除：
-            // 画整行会把昵称、时间这些界面文字一起喂进模型，比认不出来更糟。
-            ?: hits.filter {
-                it.view !is ViewGroup && !isAvatarLike(it) && !looksSquareSmall(it) &&
-                    minOf(it.w, it.h) >= dp(48)
-            }.maxByOrNull { it.w * it.h }
+        val specs = hits.map { h ->
+            ImageCandidateSpec(
+                width = h.w,
+                height = h.h,
+                depth = h.depth,
+                isLeaf = h.view !is ViewGroup,
+                isAvatarLike = isAvatarLike(h),
+                isSquareSmall = looksSquareSmall(h),
+                isBig = h.big,
+            )
+        }
+        val selected = selectImageCandidate(specs, hits.indexOfFirst { it.view === row })
+        val hit = hits.getOrNull(selected)
 
         val probe = buildString {
             append("行 ").append(rowW).append('x').append(rowH).append(" 视图 ").append(visited)
