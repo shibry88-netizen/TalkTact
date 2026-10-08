@@ -63,6 +63,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -3092,58 +3093,76 @@ fun RolesScreen(store: ConfigStore, glassAlpha: Float, open: String?, onOpen: (S
                 // 紫色当成了「正常」用，跟状态语义打架）。关系没写靠下面那行琥珀文字说。
                 border = if (self) palette.okMark.copy(alpha = CardBorderAlpha) else null,
             ) {
-                Column(
-                    Modifier.fillMaxWidth().combinedClickable(
-                        onClick = { onOpen(role.key) },
-                        // 「本人」不给删：它是常驻条目，删了也会立刻回来（见 Roles.withSelf）
-                        onLongClick = { if (!self) pendingDelete = role.key },
-                    ),
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (self) {
-                            StatusDot(palette.okMark)
+                // 卡面差异化（设计师 P1）：「本人」不是「某个联系人」—— 它管的是我自己的说话风格，
+                // 是系统条目。给它一条**渐变竖条** + 一枚「系统」chip，一眼就和下面的联系人区分开。
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    if (self) {
+                        Box(
+                            Modifier
+                                .width(4.dp)
+                                .height(52.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Brush.verticalGradient(listOf(palette.primary, palette.okMark))),
+                        )
+                        Spacer(Modifier.width(12.dp))
+                    }
+                    Column(
+                        Modifier.weight(1f).combinedClickable(
+                            onClick = { onOpen(role.key) },
+                            // 「本人」不给删：它是常驻条目，删了也会立刻回来（见 Roles.withSelf）
+                            onLongClick = { if (!self) pendingDelete = role.key },
+                        ),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (self) {
+                                StatusDot(palette.okMark)
+                            }
+                            Text(
+                                role.name,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (self) palette.ok else palette.text,
+                                modifier = Modifier.padding(start = if (self) 6.dp else 0.dp).weight(1f, fill = false),
+                            )
+                            if (self) {
+                                Spacer(Modifier.width(8.dp))
+                                StatusChip("系统", palette.okMark)
+                            }
+                            if (role.renamed) {
+                                Text(
+                                    " ◦ 识别名 ${role.key.take(10)}",
+                                    fontSize = 10.sp,
+                                    color = palette.warn,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            } else {
+                                Spacer(Modifier.weight(1f))
+                            }
+                            Text("${role.msgs.size} 条", fontSize = 13.sp, color = palette.sub)
                         }
                         Text(
-                            role.name,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = if (self) palette.ok else palette.text,
-                            modifier = Modifier.padding(start = if (self) 6.dp else 0.dp).weight(1f, fill = false),
+                            when {
+                                self && store.selfStyleEnabled() && store.selfSkill().isNotBlank() ->
+                                    "说话风格 skill：已开启 · ${formatTime(store.selfSkillAt())} 生成"
+                                self && store.selfStyleEnabled() -> "说话风格 skill：已开启（还没生成）"
+                                self -> "说话风格 skill：未开启（点进去打开）"
+                                role.relation.isBlank() -> "还没写 TA 是你什么人"
+                                else -> "${role.relation}${if (role.note.isBlank()) "" else " · ${role.note.take(18)}"}"
+                            },
+                            fontSize = 13.sp,
+                            color = when {
+                                self -> palette.ok
+                                role.relation.isBlank() -> palette.warn
+                                // 批 4c：紫色只表示「选中 / 主操作」，不承担「正常」—— 普通档案用次要文字色
+                                else -> palette.sub
+                            },
                         )
-                        if (role.renamed) {
-                            Text(
-                                " ◦ 识别名 ${role.key.take(10)}",
-                                fontSize = 10.sp,
-                                color = palette.warn,
-                                modifier = Modifier.weight(1f),
-                            )
-                        } else {
-                            Spacer(Modifier.weight(1f))
-                        }
-                        Text("${role.msgs.size} 条", fontSize = 13.sp, color = palette.sub)
+                        Text(
+                            "最近一条：${if (role.lastAt > 0) formatTime(role.lastAt) else "—"}",
+                            fontSize = 13.sp,
+                            color = palette.sub,
+                        )
                     }
-                    Text(
-                        when {
-                            self && store.selfStyleEnabled() && store.selfSkill().isNotBlank() ->
-                                "说话风格 skill：已开启 · ${formatTime(store.selfSkillAt())} 生成"
-                            self && store.selfStyleEnabled() -> "说话风格 skill：已开启（还没生成）"
-                            self -> "说话风格 skill：未开启（点进去打开）"
-                            role.relation.isBlank() -> "还没写 TA 是你什么人"
-                            else -> "${role.relation}${if (role.note.isBlank()) "" else " · ${role.note.take(18)}"}"
-                        },
-                        fontSize = 13.sp,
-                        color = when {
-                            self -> palette.ok
-                            role.relation.isBlank() -> palette.warn
-                            // 批 4c：紫色只表示「选中 / 主操作」，不承担「正常」—— 普通档案用次要文字色
-                            else -> palette.sub
-                        },
-                    )
-                    Text(
-                        "最近一条：${if (role.lastAt > 0) formatTime(role.lastAt) else "—"}",
-                        fontSize = 13.sp,
-                        color = palette.sub,
-                    )
                 }
             }
         }
@@ -3308,7 +3327,19 @@ private fun RoleDetail(
                 Spacer(Modifier.height(6.dp))
                 Text(it, fontSize = 13.sp, color = palette.ok)
             }
-            Spacer(Modifier.height(12.dp))
+        }
+
+        // 危险操作独立成一张卡（设计师 P1）：它们原来挤在「记下来的聊天」卡底部、
+        // 和「合并进来」只隔一行，而这两个都**不可撤销** —— 误触的代价太大，不该混在浏览区里。
+        GlassCard(glassAlpha, border = palette.badMark.copy(alpha = CardBorderAlpha)) {
+            Text("危险操作", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.bad)
+            Text(
+                "下面两个都不能撤销：清空只删记下来的聊天（改名与档案保留）；" +
+                    "删除会把这条角色整个删掉（记录 + 档案一起）。",
+                fontSize = 13.sp,
+                color = palette.sub,
+            )
+            Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(
                     onClick = { confirm = "clear" },
