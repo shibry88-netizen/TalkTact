@@ -1267,9 +1267,25 @@ fun SettingsScreen(
 
         GlassCard(d.glassAlpha) {
             Text("高级设置", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
-            HintText(
-                "接口地址 / API Key / 模型、微信内自动分析（参考条数 · 最短间隔 · temperature · 敏感内容检查）、\n" +
-                    "备份 / 迁移、诊断 —— 都在这一层里面。",
+            // 三行「现在是什么样」：入口卡原来只有一句名词罗列（接口地址 / 分析 / 备份 / 诊断），
+            // 看完仍然不知道当前配成了什么。摘要只**报状态**、不做判断，要改再进去。
+            // 三行分别对应高级设置里的「接入 / 微信内 / 识别」三组，找东西时可以对上号。
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "接入：${d.baseUrl.ifBlank { "未填" }}　模型 ${d.model.ifBlank { "未填" }}　" +
+                    "${if (d.graded) "模型分级" else "直通"}",
+                fontSize = 13.sp,
+                color = palette.text,
+            )
+            Text(
+                "微信内：自动分析 ${if (d.enabled) "开" else "关"}　参考 ${d.ctx} 条　间隔 ${d.minIntervalSec}s　" +
+                    "白名单 ${if (d.whitelistEnabled) "${d.whitelist.size} 个" else "关"}",
+                fontSize = 13.sp,
+                color = palette.sub,
+            )
+            Text(
+                "识别：图片文字 ${if (d.ocrEnabled) "开" else "关"}　本地代理 ${if (d.proxyEnabled) "开" else "关"}　" +
+                    "归属地查询 ${if (d.geoEnabled) "开" else "关"}",
                 fontSize = 13.sp,
                 color = palette.sub,
             )
@@ -2810,12 +2826,55 @@ fun DiagScreen(store: ConfigStore, glassAlpha: Float, onBack: () -> Unit) {
     val lastCallAt = remember(tick) { store.lastCallAt() }
     val trace = remember(tick) { store.trace() }
     val traceAt = remember(tick) { store.traceAt() }
+    val context = LocalContext.current
+    var exportNote by remember { mutableStateOf("") }
+    // 页底的「导出诊断包」：排障时「抓完就能打包发给对方」，不用退回「高级设置 → 备份」去找。
+    val diagLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip"),
+    ) { uri ->
+        if (uri != null) {
+            exportNote = try {
+                context.contentResolver
+                    .openOutputStream(uri)
+                    ?.use { it.write(buildDiagZip(context, store, store.load())) }
+                "已导出 —— 发之前建议先打开看一眼（含聊天内容，不含 API Key）"
+            } catch (t: Throwable) {
+                "导出失败：${t.message}"
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 120.dp)) {
         ScreenHeader("诊断", "抓界面 · 看轨迹与调用 · 复制发我") {
             HeaderButton("↻ 刷新") { tick++ }
             Spacer(Modifier.width(8.dp))
             HeaderButton("← 返回", onBack)
+        }
+
+        // 「最近一次调用」提到**页首**：出问题时第一眼看的就是「实际发出去的到底是什么」，
+        // 而它原本排在整页最后，滚半天才到 —— 偏偏这是最常被复制的那一段。
+        if (lastCall.isNotBlank()) {
+            GlassCard(glassAlpha, border = palette.primary.copy(alpha = CardBorderAlpha)) {
+                Text("最近一次调用（注入侧真正发出去的）", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
+                Text(
+                    "发生于 ${formatTime(lastCallAt)} · 这里是微信进程实际拿去调接口的那一份，不是本 App 里的配置。" +
+                        "核对「当前军师」有没有真的生效，看 system 长度那一行。",
+                    fontSize = 13.sp,
+                    color = palette.sub,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(lastCall, fontSize = 10.sp, color = palette.text)
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { clipboard.setText(AnnotatedString(lastCall)) },
+                    shape = RoundedCornerShape(RadiusR2),
+                ) { Text("复制这一段") }
+            }
+        } else {
+            GlassCard(glassAlpha) {
+                Text("还没有调用记录", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
+                Text("在微信里生成过一次候选回复之后，那份请求就会留在这里。", fontSize = 13.sp, color = palette.sub)
+            }
         }
 
         // 归属地从「高级设置」沉到这里：只读的排障信息，跟「要配的」分开。
@@ -2894,28 +2953,15 @@ fun DiagScreen(store: ConfigStore, glassAlpha: Float, onBack: () -> Unit) {
             }
         }
 
-        if (lastCall.isNotBlank()) {
-            GlassCard(glassAlpha, border = palette.primary.copy(alpha = CardBorderAlpha)) {
-                Text("最近一次调用（注入侧真正发出去的）", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
-                Text(
-                    "发生于 ${formatTime(lastCallAt)} · 这里是微信进程实际拿去调接口的那一份，不是本 App 里的配置。" +
-                        "核对「当前军师」有没有真的生效，看 system 长度那一行。",
-                    fontSize = 13.sp,
-                    color = palette.sub,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(lastCall, fontSize = 10.sp, color = palette.text)
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = { clipboard.setText(AnnotatedString(lastCall)) },
-                    shape = RoundedCornerShape(RadiusR2),
-                ) { Text("复制这一段") }
-            }
-        } else {
-            GlassCard(glassAlpha) {
-                Text("还没有调用记录", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
-                Text("在微信里生成过一次候选回复之后，那份请求就会留在这里。", fontSize = 13.sp, color = palette.sub)
-            }
+        // 页底固定一个次级导出入口（排障动线：抓完 → 打包 → 发出去）
+        Spacer(Modifier.height(6.dp))
+        OutlinedButton(
+            onClick = { diagLauncher.launch("TalkTact-诊断包.zip") },
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(RadiusR2),
+        ) { Text("导出诊断包（.zip）") }
+        if (exportNote.isNotBlank()) {
+            Text(exportNote, fontSize = 13.sp, color = palette.sub, modifier = Modifier.padding(top = 6.dp))
         }
     }
 }
