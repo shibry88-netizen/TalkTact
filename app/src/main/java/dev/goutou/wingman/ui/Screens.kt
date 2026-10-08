@@ -457,11 +457,20 @@ fun StatusScreen(store: ConfigStore, onTrial: () -> Unit) {
     val warn = checks.count { it.level == Level.WARN }
     val ok = checks.count { it.level == Level.OK }
     val overall = if (bad > 0) Level.BAD else if (warn > 0) Level.WARN else Level.OK
+    // 明细按「**异常优先**」排：有问题 → 待确认 → 通过（同档内保持原来的顺序 —— Kotlin 的 sortedBy 是稳定排序）。
+    // 以前固定按声明顺序铺开，出问题时最该动的那一条可能排在第 5 位，一眼看不出该先处理哪个。
+    val ordered = checks.sortedBy {
+        when (it.level) {
+            Level.BAD -> 0
+            Level.WARN -> 1
+            Level.OK -> 2
+        }
+    }
     val shown = when (filter) {
-        1 -> checks.filter { it.level == Level.BAD }
-        2 -> checks.filter { it.level == Level.WARN }
-        3 -> checks.filter { it.level == Level.OK }
-        else -> checks
+        1 -> ordered.filter { it.level == Level.BAD }
+        2 -> ordered.filter { it.level == Level.WARN }
+        3 -> ordered.filter { it.level == Level.OK }
+        else -> ordered
     }
 
     LazyColumn(contentPadding = PaddingValues(bottom = 120.dp)) {
@@ -506,6 +515,16 @@ fun StatusScreen(store: ConfigStore, onTrial: () -> Unit) {
                             fontSize = 13.sp,
                             color = palette.sub,
                         )
+                        // hero 的职责收窄成两件事：一眼看健康 + 直接点出**最该处理的那一条**。
+                        // 完整明细整包交给下面的「详细状态」（那边是异常优先排序）。
+                        val firstIssue = ordered.firstOrNull { it.level != Level.OK }
+                        if (firstIssue != null) {
+                            Text(
+                                "最该处理：${firstIssue.title} —— ${firstIssue.desc.take(70)}",
+                                fontSize = 13.sp,
+                                color = levelText(palette, firstIssue.level),
+                            )
+                        }
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -521,7 +540,8 @@ fun StatusScreen(store: ConfigStore, onTrial: () -> Unit) {
                 // 原来那 7 项明细是直接铺在页面上的，把这一页撑得很长；现在收在折叠菜单里
                 DetailToggle(
                     expanded = detail,
-                    summary = "${checks.size} 项：通过 $ok · 待确认 $warn · 有问题 $bad",
+                    // 摘要里把「异常优先」写明：展开后第一眼就是该动的那几条，不用自己往下翻
+                    summary = "详细状态（异常优先）· ${checks.size} 项：有问题 $bad · 待确认 $warn · 通过 $ok",
                     glassAlpha = glass,
                 ) { detail = !detail }
                 AnimatedVisibility(
@@ -679,6 +699,8 @@ fun TrialScreen(store: ConfigStore, glassAlpha: Float) {
     var input by remember { mutableStateOf("对方: 在吗\n我: 在\n对方: 周末有空吗，想约你吃个饭") }
     var suggestion by remember { mutableStateOf<Suggestion?>(null) }
     var rewriting by remember { mutableStateOf<Int?>(null) }
+    /** 哪一条的「✎」被点开了 —— 预设只在点开时出现（和微信里那张卡片同一套做法）。 */
+    var presetsOpen by remember { mutableStateOf<Int?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var info by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
@@ -770,71 +792,98 @@ fun TrialScreen(store: ConfigStore, glassAlpha: Float) {
             if (s.replies.isEmpty()) {
                 Text("⚠ 这次没拿到可用回复，点上面「生成候选回复」重来", fontSize = 13.sp, color = palette.warn)
             }
-            s.replies.forEachIndexed { index, reply ->
-                val starred = s.best == index
-                GlassCard(
-                    glassAlpha,
-                    border = if (starred) palette.primary.copy(alpha = CardBorderAlpha) else null,
-                ) {
-                    Column(Modifier.fillMaxWidth().clickable { clipboard.setText(AnnotatedString(reply.text)) }) {
+            // 与微信里那张卡片**同一套规格**（设计师 P1）：三条候选装在**同一张卡**里，
+            // 每条是一个圆角填充块（头行「★ 风格 · 偏长」+ 右侧 ✎），预设**点 ✎ 才出现**。
+            // 以前这里是「每条候选一张 GlassCard + 三个预设永远铺在外面」，和微信卡片是两套做法 ——
+            // 同一个东西两副长相，用户得学两遍。
+            GlassCard(glassAlpha) {
+                s.replies.forEachIndexed { index, reply ->
+                    val starred = s.best == index
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(RadiusR2))
+                            .background(palette.soft)
+                            .clickable { clipboard.setText(AnnotatedString(reply.text)) }
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(reply.style, color = palette.primary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                            if (starred) {
-                                Spacer(Modifier.width(6.dp))
-                                // 选中态走 chip 形态（批 4c）：底色 alpha 0.14 + 1dp 描边 + 13sp
-                                StatusChip("★ 最推荐", palette.primary)
-                            }
+                            Text(
+                                buildString {
+                                    append(if (starred) "★ " else "")
+                                    append(reply.style)
+                                    if (isReplyTooLong(reply.text)) append(" · 偏长")
+                                },
+                                color = palette.primary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            // ✎ = 展开这一条的预设（再短点 / 更正式 / 换个说法），另外两条不动
+                            Text(
+                                "✎",
+                                fontSize = 13.sp,
+                                color = palette.sub,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(RadiusR1))
+                                    .background(palette.primary.copy(alpha = ChipBgAlpha))
+                                    .clickable { presetsOpen = if (presetsOpen == index) null else index }
+                                    .padding(horizontal = 10.dp, vertical = 3.dp),
+                            )
                         }
                         Text(reply.text, fontSize = 15.sp, color = palette.text)
                         if (starred && s.why.isNotBlank()) {
-                            Text(s.why, fontSize = 13.sp, color = palette.sub)
+                            Text("★ 最推荐：${s.why}", fontSize = 13.sp, color = palette.sub)
                         }
                         if (isReplyTooLong(reply.text)) {
                             Text(
-                                "${reply.text.length} 字，偏长 —— 微信里发出去不太像人话，可以点下面的「再短点」",
+                                "${reply.text.length} 字，偏长 —— 发出去不太像人话，点右上角 ✎ 选「再短点」",
                                 fontSize = 13.sp,
                                 color = palette.warn,
                             )
                         }
-                        // 只改这一条：走 complete()（一句话进一句话出），另外两条不动
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            REWRITE_PRESETS.forEach { preset ->
-                                Text(
-                                    text = if (rewriting == index) "改写中…" else preset.first,
-                                    fontSize = 13.sp,
-                                    color = palette.primary,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(RadiusR1))
-                                        .background(palette.primary.copy(alpha = ChipBgAlpha))
-                                        .clickable(enabled = rewriting == null) {
-                                            val old = suggestion?.replies?.getOrNull(index)?.text ?: return@clickable
-                                            rewriting = index
-                                            val conf = store.load()
-                                            scope.launch {
-                                                try {
-                                                    val (newText, tokens) = withContext(Dispatchers.IO) {
-                                                        LlmClient(conf).rewrite(old, preset.second)
-                                                    }
-                                                    if (tokens > 0) store.addUsage(tokens)
-                                                    suggestion = suggestion?.let { cur ->
-                                                        val list = cur.replies.toMutableList()
-                                                        if (index in list.indices) {
-                                                            list[index] = list[index].copy(text = newText)
+                        if (presetsOpen == index) {
+                            Spacer(Modifier.height(6.dp))
+                            // 只改这一条：走 complete()（一句话进一句话出），另外两条不动
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                REWRITE_PRESETS.forEach { preset ->
+                                    Text(
+                                        text = if (rewriting == index) "改写中…" else preset.first,
+                                        fontSize = 13.sp,
+                                        color = palette.primary,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(RadiusR1))
+                                            .background(palette.primary.copy(alpha = ChipBgAlpha))
+                                            .clickable(enabled = rewriting == null) {
+                                                val old = suggestion?.replies?.getOrNull(index)?.text ?: return@clickable
+                                                rewriting = index
+                                                val conf = store.load()
+                                                scope.launch {
+                                                    try {
+                                                        val (newText, tokens) = withContext(Dispatchers.IO) {
+                                                            LlmClient(conf).rewrite(old, preset.second)
                                                         }
-                                                        cur.copy(replies = list)
+                                                        if (tokens > 0) store.addUsage(tokens)
+                                                        suggestion = suggestion?.let { cur ->
+                                                            val list = cur.replies.toMutableList()
+                                                            if (index in list.indices) {
+                                                                list[index] = list[index].copy(text = newText)
+                                                            }
+                                                            cur.copy(replies = list)
+                                                        }
+                                                    } catch (t: Throwable) {
+                                                        error = "改写失败：${t.message}"
                                                     }
-                                                } catch (t: Throwable) {
-                                                    error = "改写失败：${t.message}"
+                                                    rewriting = null
                                                 }
-                                                rewriting = null
                                             }
-                                        }
-                                        .padding(horizontal = 8.dp, vertical = 3.dp),
-                                )
+                                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                                    )
+                                }
                             }
                         }
-                        Text("点击复制", fontSize = 13.sp, color = palette.sub)
+                        Text("点一下复制", fontSize = 13.sp, color = palette.sub)
                     }
+                    Spacer(Modifier.height(8.dp))
                 }
             }
         }
