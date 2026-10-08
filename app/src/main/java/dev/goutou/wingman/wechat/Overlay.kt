@@ -85,15 +85,30 @@ internal class Panel(private val a: Activity) {
     private val night = (a.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
         Configuration.UI_MODE_NIGHT_YES
 
-    private val colorCard = if (night) 0xF21B1A22.toInt() else 0xF2FFFFFF.toInt()
+    /**
+     * 微信里这张卡片的底色 —— 和 App 里是同一套玻璃语义：**半透明 + 一道边**。
+     *
+     * 浅色场景从「白 0.95」改成**白 0.72**：以前那块近乎不透明的白压在聊天背景上，
+     * 跟 App 里被吐槽的「一圈玻璃围着一块白板」是同一个毛病。深色场景本来就够暗，维持原值。
+     */
+    private val colorCard = if (night) 0xF21B1A22.toInt() else 0xB8FFFFFF.toInt()
     private val colorStroke = if (night) 0x557C3AED.toInt() else 0x447C3AED.toInt()
     private val colorMain = if (night) 0xFFEDEAF5.toInt() else 0xFF1C1B22.toInt()
     private val colorSub = if (night) 0xFF9A96A8.toInt() else 0xFF6E6A7C.toInt()
     private val colorReply = if (night) 0xFF2A2440.toInt() else 0xFFEDE7FA.toInt()
     private val colorAccent = 0xFF7C3AED.toInt()
     private val colorWarn = 0xFFE8A317.toInt()
+    /** 「中」当实底用的深一档琥珀（白字压在上面要够对比）。 */
+    private val colorWarnSolid = 0xFFC97A00.toInt()
     private val colorBad = 0xFFD64545.toInt()
     private val colorOk = 0xFF2FA566.toInt()
+    /**
+     * 风险等级 → 语义色（**唯一一份**映射）。
+     *
+     * 以前 chip 底色和标题文字各写了一个 `when`，四档里有三档其实写成了不同的色号 ——
+     * 看着是「同一件事」，改的时候却得改两处，还容易越改越不一致。
+     */
+    private val riskMap = mapOf("低" to colorOk, "中" to colorWarn, "高" to colorBad)
 
     private val card = LinearLayout(a)
     private val title = TextView(a)
@@ -103,9 +118,28 @@ internal class Panel(private val a: Activity) {
     private var attached = false
     private var running = false
     private var onChat = false
-    private var busy = false
-    private var rewriteBusy = false
-    private var force = false
+    /**
+     * 手上的异步任务 —— 注入侧状态机**唯一的**「在忙」真值。
+     *
+     * 以前是三个字段各管一摊（busy / rewriteBusy / pendingRequestKey），于是状态会自相矛盾：
+     * 改写途中「分析」也以为自己在跑、在飞的请求和当前这一屏对不上号。
+     * 收敛成一个 job 之后，「忙不忙、忙的是哪一屏」只有一个来源（[busy] / [rewriteBusy] 都是它的派生值）。
+     */
+    private var job: Job = Job.None
+    /** 正在为某一屏问模型（[job] 的派生值）。 */
+    private val busy: Boolean get() = job is Job.Analyze
+    /** 正在改写某一条候选（[job] 的派生值）。 */
+    private val rewriteBusy: Boolean get() = job is Job.Rewrite
+    /** 在飞的那次分析挂在哪一屏（没在分析时是空串）。 */
+    private val pendingRequestKey: String get() = (job as? Job.Analyze)?.key.orEmpty()
+    /**
+     * 用户**明确要求重看这一屏**（点了「重新识别」/ 放行了敏感内容）。
+     *
+     * 只做一件事：让这一轮跳过「没变就不重读」那道早退，并且「读不到消息列表」也照样报给用户
+     * （否则点了按钮什么都不会发生）。它是一次性的：那一轮走完就清掉。
+     * （换掉了原来那个 force —— 名字说不清它是干嘛的，而且读它的人得自己猜。）
+     */
+    private var recheck = false
     private var generation = 0
     private var cardTop = -1
     private var lastCallAt = 0L
@@ -180,7 +214,7 @@ internal class Panel(private val a: Activity) {
     private var chatName = ""
     private var lastScreenFingerprint = ""
     private var contextRevision = ""
-    private var pendingRequestKey = ""
+    // （pendingRequestKey 现在是 job 的派生值，见下面的 Job）
     /** 打开会话时顺手认出来的名字（给「白名单」页当候选）；白名单关着时一条都不收。 */
     private val seenChats = LinkedHashSet<String>()
     /** 上一次读会话列表的时间 / 已处理到哪个请求 / 上次回传过的那一批（免得每 2.6 秒重发）。 */
@@ -251,16 +285,9 @@ internal class Panel(private val a: Activity) {
 
     fun onPause() {
         running = false
-        busy = false
-        rewriteBusy = false
-        onChat = false
-        generation++
         if (expanded) Trace.note("卡片", "收起（微信这一页暂停 / 切走）")
-        expanded = false
-        body = Body.None
         handler.removeCallbacks(ticker)
-        card.visibility = View.GONE
-        chip.visibility = View.GONE
+        resetPanel()
     }
 
     // ---------------- 视图 ----------------
@@ -512,10 +539,10 @@ internal class Panel(private val a: Activity) {
                     "连续 $noListTicks 轮找不到消息列表（微信可能换了控件类型）"
                 },
             )
-            if (noListTicks >= 2) {
+            if (noListTicks >= 2 || recheck) {
                 dumpDiagnosis(decor, null, input, "找到了输入框，但没找到消息列表")
-                if (force || noListTicks == 2) {
-                    force = false
+                if (recheck || noListTicks == 2) {
+                    recheck = false
                     showMessage(
                         "没找到消息列表（微信版本可能改了控件类型）。\n" +
                             "诊断已保存到 App 首页，长按标题可再次生成。",
@@ -582,8 +609,7 @@ internal class Panel(private val a: Activity) {
             val prevGroups = lastSettingsGroups
             lastSettingsGroups = settingsGroups
             generation++ // Discard replies and rewrites started for the previous conversation or profile.
-            busy = false
-            rewriteBusy = false
+            job = Job.None
             contextRevision = revision
             chatName = observedName
             lastScreenFingerprint = ""
@@ -621,12 +647,56 @@ internal class Panel(private val a: Activity) {
         // 而且档案每长一句话就被当成「这一屏变了」→ 缓存必 miss、在飞的请求被作废。
         // 「档案变了要不要重新问」是 ask() 那一刻用 roleContext 决定的事，不该让「这一屏变没变」跟着抖。
         val fingerprint = conversationDigest(observedName, reader.fingerprint(list), revision)
-        if (!force && !ocr.takeDirty() && fingerprint == lastScreenFingerprint) {
+        if (!recheck && !ocr.takeDirty() && fingerprint == lastScreenFingerprint) {
             Trace.note("跳过", "会话、资料和这一屏未变，不重复读")
             return
         }
-        force = false
+        recheck = false
         lastScreenFingerprint = fingerprint
+
+        // 白名单：没勾的会话「彻底关闭」—— **连图都不认**。
+        //
+        // 位置从 recordToRoles 之后提到了**识图之前**：以前识图排在闸门前面，理由是
+        // 「会话名得等解析结果」—— 其实会话名读的是聊天页**标题**（上面 revision 那一段就取到了），
+        // 跟解析没关系，所以这道闸完全可以提前，白名单外的会话连图都不会被送去认字。
+        // 认出来的名字照旧回传当候选（否则「白名单开着时打开过就会出现在候选里」会失效）。
+        if (blockedByWhitelist(cfg)) {
+            rememberChatName(chatName)
+            Trace.note(
+                "白名单",
+                if (chatName.isBlank()) {
+                    "白名单开着，但这个会话的名字没认出来 → 拦下（宁可不读，也不猜；连图都不认）"
+                } else {
+                    "会话「$chatName」不在白名单里 → 不分析，也不认图"
+                },
+            )
+            setChip(if (chatName.isBlank()) "白名单 · 认不出会话名" else "白名单外 · 未启用")
+            // 认不出名字这种情况最容易让人以为「白名单坏了」—— 第一次把话说清楚，
+            // 之后只留按钮上的字（诊断在 recordToRoles 里已经写过，含标题候选）。
+            if (chatName.isBlank() && !whitelistNameNotified) {
+                whitelistNameNotified = true
+                showMessage(
+                    "白名单开着，但这个会话的名字没认出来（微信可能改了标题控件），所以先不分析。\n" +
+                        "要在这里用：到「设置 → 高级设置 → 会话白名单」里按名字手动加一个。\n" +
+                        "诊断已写入 App 首页「诊断」卡片。",
+                    isError = true,
+                )
+            } else {
+                // 按钮文案跟着 showIdle 一起写：以前 setChip 写完之后立刻被 showIdle 覆盖成「↻ 识别」，
+                // 于是「白名单外」这几个字其实从没在按钮上停住过。
+                showIdle(
+                    if (chatName.isBlank()) {
+                        "白名单开着，但这个会话的名字没认出来 → 先不分析。\n" +
+                            "要在这里用：去「设置 → 高级设置 → 会话白名单」按名字手动加一个。"
+                    } else {
+                        "「$chatName」不在白名单里 —— 按你的设置，这一屏不分析。\n" +
+                            "想让它工作就把它加进白名单；想全都分析，把白名单开关关掉。"
+                    },
+                    chip = if (chatName.isBlank()) "白名单 · 认不出会话名" else "白名单外 · 未启用",
+                )
+            }
+            return
+        }
 
         val rows = reader.snapshot(list)
         // 图片先排进后台去认（这一步不阻塞）。还有图没认完就这一轮先不分析 ——
@@ -692,46 +762,6 @@ internal class Panel(private val a: Activity) {
         // 记进「角色」页（认不出会话名就整页跳过，宁可漏记也不记错人）
         recordToRoles(decor, list, msgs)
 
-        // 白名单：没勾的会话「彻底关闭」。位置放在 recordToRoles **之后** ——
-        // 只有跑完它，这一屏的 chatName 才是刚认出来的（不然第一帧用的还是上一个聊天的名字）。
-        // recordToRoles 里面也有一道同样的闸，那道负责「连记录都不做」。
-        if (blockedByWhitelist(cfg)) {
-            Trace.note(
-                "白名单",
-                if (chatName.isBlank()) {
-                    "白名单开着，但这个会话的名字没认出来 → 拦下（宁可不读，也不猜）"
-                } else {
-                    "会话「$chatName」不在白名单里 → 不分析"
-                },
-            )
-            setChip(if (chatName.isBlank()) "白名单 · 认不出会话名" else "白名单外 · 未启用")
-            // 认不出名字这种情况最容易让人以为「白名单坏了」—— 第一次把话说清楚，
-            // 之后只留按钮上的字（诊断在 recordToRoles 里已经写过，含标题候选）。
-            if (chatName.isBlank() && !whitelistNameNotified) {
-                whitelistNameNotified = true
-                showMessage(
-                    "白名单开着，但这个会话的名字没认出来（微信可能改了标题控件），所以先不分析。\n" +
-                        "要在这里用：到「设置 → 高级设置 → 会话白名单」里按名字手动加一个。\n" +
-                        "诊断已写入 App 首页「诊断」卡片。",
-                    isError = true,
-                )
-            } else {
-                // 按钮文案跟着 showIdle 一起写：以前 setChip 写完之后立刻被 showIdle 覆盖成「↻ 识别」，
-                // 于是「白名单外」这几个字其实从没在按钮上停住过。
-                showIdle(
-                    if (chatName.isBlank()) {
-                        "白名单开着，但这个会话的名字没认出来 → 先不分析。\n" +
-                            "要在这里用：去「设置 → 高级设置 → 会话白名单」按名字手动加一个。"
-                    } else {
-                        "「$chatName」不在白名单里 —— 按你的设置，这一屏不分析。\n" +
-                            "想让它工作就把它加进白名单；想全都分析，把白名单开关关掉。"
-                    },
-                    chip = if (chatName.isBlank()) "白名单 · 认不出会话名" else "白名单外 · 未启用",
-                )
-            }
-            return
-        }
-
         // 安全网：一条文字都没读到，说明「读的东西」本身就不对。
         // 这时候去调模型只会浪费 token 并给出荒谬建议，所以先停下、留诊断、明确告诉用户。
         if (msgs.size >= 2 && msgs.all { it.attachment }) {
@@ -759,10 +789,11 @@ internal class Panel(private val a: Activity) {
         // 留着这一屏的消息：点按钮要「摆出缓存」时用它渲染历史行（[onChipClick] 的 ③）
         lastMsgs = msgs
         if (rewriteBusy) return
+        if (busy && pendingRequestKey == requestKey) return
         if (busy) {
-            if (pendingRequestKey == requestKey) return
+            // 这一屏换了（同一会话里内容变了）：作废在飞的那次，接着走缓存 / 重新分析
             generation++
-            busy = false
+            job = Job.None
         }
         cache[requestKey]?.let {
             Trace.note("缓存", "这一屏之前问过，直接用缓存（不烧 token）")
@@ -947,12 +978,23 @@ internal class Panel(private val a: Activity) {
             val now = System.currentTimeMillis()
             if (sentMsgs.size > 400) sentMsgs.clear()
             val fresh = ArrayList<Pair<String, RoleMsg>>()
+            // 隐私口径：**命中敏感词的消息不写进角色档案**。
+            //
+            // 以前敏感闸门排在记录**之后**，于是被判敏感的正文照样进了档案，下一轮又作为
+            // 「角色背景」进提示词发出去 ——「只提示、不外发」当时只对当次那一次调用成立。
+            // 现在在**归档这一步**就滤掉：既不留档，也就永远进不了提示词。
+            // 用户自己关掉了敏感检查（allowSensitive）时按他的选择走，照常记录。
+            // ⚠️ 放行过一次（点「仍然分析这一条」）也**不**补记：那只是同意「这一次发」，
+            // 不等于同意「以后每次都作为背景发」。
+            val sensitiveGate = c != null && !c.allowSensitive
+            // 一次算好：哪些能进档案、被拦下几条（纯函数，单测见 SensitiveArchiveTest）
+            val (archived, sensitiveSkipped) = sensitiveArchiveFilter(msgs, sensitiveGate)
 
             // ①「本人」这条线（可选开关）：只收我发出去的，而且和「现在聊的是谁」无关 ——
             //    要提炼的是「我怎么说话」，跟对方是谁没关系。所以刻意排在认会话名**之前**：
             //    认不出会话名的那些页面，我自己的话照样有效。开关关着就一条都不收。
             if (prefs?.getBoolean(Keys.SELF_STYLE_ON, false) == true) {
-                for (m in msgs) {
+                for (m in archived) {
                     if (!m.fromMe || m.attachment || m.text.isBlank()) continue
                     if (!sentMsgs.add("s|" + m.text)) continue
                     fresh.add(SELF_ROLE_KEY to RoleMsg(true, m.text, now))
@@ -961,13 +1003,20 @@ internal class Panel(private val a: Activity) {
 
             // ② 按联系人归档：认不出会话名就整页跳过（宁可漏记也不能记错人）
             if (chatName.isNotBlank()) {
-                for (m in msgs) {
+                for (m in archived) {
                     if (m.attachment || m.text.isBlank()) continue
                     if (!sentMsgs.add(roleObservationKey(chatName, m.fromMe, m.text))) continue
                     fresh.add(chatName to RoleMsg(m.fromMe, m.text, now))
                 }
             }
 
+            if (sensitiveSkipped > 0) {
+                // 只记条数，不记正文 —— 轨迹会回传、常驻 App 本地
+                Trace.note(
+                    "敏感",
+                    "$sensitiveSkipped 条命中敏感词，没有记进角色档案（不进档 = 以后也不会作为背景发出去）",
+                )
+            }
             if (fresh.isEmpty()) return
             // 分批，别把广播的 extras 撑爆
             fresh.chunked(20).forEach { Heartbeat.send(a, 0, roles = Roles.encodeIncoming(it)) }
@@ -1088,7 +1137,7 @@ internal class Panel(private val a: Activity) {
         }
         buildString {
             append("—— 面板状态 ——\n")
-            append("running=$running attached=$attached onChat=$onChat busy=$busy force=$force\n")
+            append("running=$running attached=$attached onChat=$onChat job=$job recheck=$recheck\n")
             append("card=${vis(card)} isShown=${card.isShown} 挂在当前decor=${card.parent === decor}\n")
             append("chip=${vis(chip)} isShown=${chip.isShown} 文本=「${chipText}」 挂在当前decor=${chip.parent === decor}\n")
             append("折叠：expanded=$expanded hasResult=$hasResult\n")
@@ -1169,8 +1218,7 @@ internal class Panel(private val a: Activity) {
     }
 
     private fun ask(cfg: ConfigData, msgs: List<ChatMsg>, fingerprint: String, roleContext: String?) {
-        busy = true
-        pendingRequestKey = fingerprint
+        job = Job.Analyze(fingerprint)
         lastCallAt = System.currentTimeMillis()
         // 只记「几条 · 哪个会话 · 走哪条路」，**不记正文**
         Trace.note(
@@ -1234,7 +1282,7 @@ internal class Panel(private val a: Activity) {
             val err = error
             handler.post {
                 if (gen != generation) return@post
-                busy = false
+                job = Job.None
                 Trace.note(
                     "结果",
                     when {
@@ -1263,7 +1311,9 @@ internal class Panel(private val a: Activity) {
     private fun regenerate() {
         cache.remove(lastFingerprint)
         lastCallAt = 0
-        force = true
+        // 「没变就不重读」那道早退要放过这一轮；再读不到消息列表也要照样报出来
+        lastScreenFingerprint = ""
+        recheck = true
         handler.post {
             runCatching { tick() }.onFailure { XposedApi.log("refresh: $it") }
         }
@@ -1291,13 +1341,13 @@ internal class Panel(private val a: Activity) {
             showMessage("读不到配置，改写用不了", isError = true)
             return
         }
-        if (busy || rewriteBusy) return
+        if (job != Job.None) return
         opts.visibility = View.GONE
         val gen = generation
         val requestKey = lastFingerprint
         val original = reply.text
         body.text = "$head｜改写中…"
-        rewriteBusy = true
+        job = Job.Rewrite(requestKey)
         Thread {
             var text: String? = null
             var err: Throwable? = null
@@ -1314,7 +1364,7 @@ internal class Panel(private val a: Activity) {
             handler.post {
                 runCatching {
                     if (gen != generation) return@runCatching
-                    rewriteBusy = false
+                    job = Job.None
                     if (done != null) {
                         body.text = "$head｜$done"
                         val cur = cache[requestKey] ?: shown
@@ -1468,7 +1518,8 @@ internal class Panel(private val a: Activity) {
         go.setOnClickListener {
             // 记住「这一屏已被你放行」：用屏稳定键，点一次就一直有效（换了屏 / 换了会话自然失效）
             skipSensitiveFor = screenKey
-            force = true
+            lastScreenFingerprint = ""
+            recheck = true
             Trace.note("敏感", "用户点了「仍然分析这一条」→ 这一屏放行（不再拦）")
             handler.post { runCatching { tick() } }
         }
@@ -1553,12 +1604,20 @@ internal class Panel(private val a: Activity) {
         applyVisibility()
     }
 
+    /**
+     * 风险 → **实底**（chip 底色）：白字压在上面，所以走「同色 + 降不透明度」这一条规则，
+     * 不再单独维护第二套色号。
+     *
+     * 「中」是唯一的例外：「文字档」的琥珀（0xFFE8A317）当底色压白字太浅、读不出来 ——
+     * 所以实底取同色系**深一档**的 [colorWarnSolid]，而不是换一个颜色。
+     */
     private fun chipColor(risk: String): Int = when (risk) {
-        "低" -> 0xE62FA566.toInt()
-        "中" -> 0xE6C97A00.toInt()
-        "高" -> 0xE6D64545.toInt()
-        else -> 0xE67C3AED.toInt()
+        "中" -> solidOf(colorWarnSolid)
+        else -> solidOf(riskColor(risk))
     }
+
+    /** 语义色 → 实底（0.9 不透明度）。 */
+    private fun solidOf(c: Int): Int = 0xE6000000.toInt() or (c and 0x00FFFFFF)
 
     /**
      * 点按钮：开着就收起；有内容就打开；都没有才去识别一次（判定见纯函数 [chipTap]）。
@@ -1632,13 +1691,20 @@ internal class Panel(private val a: Activity) {
      */
     private fun hideAll(why: String) {
         Trace.note("隐藏", "整块藏起来（$why）")
-        // In a non-chat page this runs on every tick; invalidate async work only once
-        // when leaving an active chat/request state.
-        if (onChat || busy || rewriteBusy) {
-            generation++
-            busy = false
-            rewriteBusy = false
-        }
+        resetPanel()
+    }
+
+    /**
+     * 把面板复位成「不在场」：作废在飞的任务 + 收起卡片 + 清内容类型与指纹。
+     *
+     * 抽出来是因为 [onPause] 与 [hideAll] 原本各写了一份，两边的字段清单还不一样 ——
+     * 于是「切走再回来」和「离开聊天页」两条路径的行为会悄悄分叉（这类分叉最难查）。
+     * 现在只有这**一份**。
+     */
+    private fun resetPanel() {
+        // 非聊天页每 2.6 秒就会走一次 hideAll，别每次都白抬 generation（没在飞的任务就不用作废）
+        if (onChat || job != Job.None) generation++
+        job = Job.None
         onChat = false
         noListTicks = 0
         expanded = false
@@ -1707,12 +1773,8 @@ internal class Panel(private val a: Activity) {
             "$who:${it.text.take(16)}"
         }
 
-    private fun riskColor(risk: String): Int = when (risk) {
-        "低" -> colorOk
-        "中" -> colorWarn
-        "高" -> colorBad
-        else -> colorAccent
-    }
+    /** 风险 → 语义色（文字档）：和 chip 底色同一份来源（[riskMap]），只有「中」的实底会再压深一档。 */
+    private fun riskColor(risk: String): Int = riskMap[risk] ?: colorAccent
 
     // ---------------- 交互 ----------------
 
@@ -1779,6 +1841,21 @@ enum class ChipTap { Collapse, Expand, Restore, Regenerate }
  * 于是守卫会误命中（正文是结果、却按敏感卡处理），而且用户点 ▾ 也收不起来。
  */
 private enum class Body { None, Idle, Thinking, Stuck, Sensitive, Result, Message }
+
+/**
+ * 手上的异步任务（注入侧状态机唯一的「在忙」真值，见 [Panel.job]）。
+ *
+ * 以前拆成 busy / rewriteBusy / pendingRequestKey 三个字段：改写途中「分析」也以为自己在跑，
+ * 而在飞的那次挂在哪一屏又只能靠另一个字段去猜。合成一个类型之后，状态不可能再自相矛盾。
+ */
+private sealed interface Job {
+    /** 手上没有在跑的任务。 */
+    object None : Job
+    /** 正在为 [key] 这一屏问模型（同一屏不用重发）。 */
+    data class Analyze(val key: String) : Job
+    /** 正在改写 [key] 那一屏里的一条候选。 */
+    data class Rewrite(val key: String) : Job
+}
 
 /**
  * 点折叠按钮的判定（纯函数，单测见 ChipTapTest）。
