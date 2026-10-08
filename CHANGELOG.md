@@ -63,6 +63,31 @@
 - **英文 README**（`README.en.md`）+ 根 README 顶部中英文互链；顺手修掉过期的版本号 / 安装包体积 /
   用例数，以及「液态玻璃界面」那一条（背景已改成程序化渐变）。
 
+### 接口形态：不再只有「OpenAI 兼容」一种
+
+- 新增「**接口形态**」下拉：OpenAI 兼容（Chat Completions，默认）/ OpenAI Responses / Anthropic Messages / 自定义路径。
+  三种形态的差异只有三处 —— URL 路径、请求体组装、鉴权头（Anthropic 走 `x-api-key` + 版本头，且
+  `max_tokens` 必填，system 是顶层字段）—— 抽成 `ApiShape` + `buildApiRequest` / `parseApiReply` 两个纯函数，
+  单测 12 例。
+- 响应解析各写各的：Responses 从 `output[]` 取正文（顺手兼容 SDK 聚合出来的 `output_text`）；
+  Anthropic 把 `input_tokens + output_tokens` 合成一个数，跟别的形态可比。
+- **接口自检也跟着形态走**：以前不管选了什么都按 `/chat/completions` 发，选了 Anthropic 的人会看到「接口 404」，
+  其实只是形态没对上。
+- ⚠️ **本地代理目前只转发 OpenAI 兼容形态**：选了 Responses / Anthropic 且代理开着时，卡片里会**直接提示**
+  把代理关掉或换回 OpenAI 兼容。这一条是刻意的 —— 代理是「Key 不出 App 进程」的核心路径，
+  为了形态去动它不划算。
+
+### 服务商预设（DeepSeek 等）
+
+- 「接口地址」上面加了「**服务商**」下拉：DeepSeek / Anthropic / 通义千问 / 智谱 GLM / Kimi / 火山方舟 /
+  百度千帆 / 硅基流动 / 阶跃星辰 / MiniMax / OpenAI。**只省掉「去官网查地址」这一步** ——
+  选中后地址、模型、形态照样能手改，也不改变任何请求逻辑。
+- **刻意不预填模型名**（只有 DeepSeek 填了，那两个名字是查过官方文档的）：模型名各家迭代很快，
+  写死一个过期的比留空更坑 —— 留空时旁边就有「从服务端拉取模型列表」。
+- 选中后会显示那一家的注意事项：DeepSeek「思考模式默认开着：`temperature` 设了不报错但**不生效**；有峰谷价」、
+  火山方舟「模型要填**推理接入点 ID**（`ep-xxxxxxxx`），不是模型名」、通义「地址必须带 `/compatible-mode`」、
+  Anthropic「鉴权走 `x-api-key`；本地代理不支持这种形态，请直连」。
+
 ### 自查
 
 - 每批改动过了「括号配平 + `git diff --check`」，逐批推 CI，全绿。

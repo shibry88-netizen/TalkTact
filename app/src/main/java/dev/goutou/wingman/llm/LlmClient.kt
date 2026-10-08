@@ -47,28 +47,26 @@ class LlmClient(
     private val second: Boolean = false,
 ) {
 
+    /** 当前接口形态。差异只有三处：URL 路径 / 请求体 / 鉴权头（见 llm/ApiShape.kt）。 */
+    private val shape: ApiShape get() = shapeOf(cfg.apiShape)
+
     /**
      * 出站地址。
      *
      * 开了本地代理就走本机回环（路径写死在 [ProxyProtocol] 里）：那段代码被注入在微信进程里，
      * 手上只有一个随机 token，Key 在 App 进程那边 —— 这就是「Key 不出 App」的做法。
      */
-    private fun outboundUrl(): String =
-        if (viaProxy()) ProxyProtocol.urlFor(cfg.proxyPort) else endpoint(cfg.baseUrl)
+    private fun outboundUrl(upstream: String): String =
+        if (viaProxy()) ProxyProtocol.urlFor(cfg.proxyPort) else upstream
 
     /** 走不走本地代理。和回传给 App 显示的是同一份判断（ProxyProtocol.routeOf）。 */
     private fun viaProxy(): Boolean =
         ProxyProtocol.routeOf(cfg.proxyEnabled, cfg.proxyToken) == ProxyProtocol.ROUTE_PROXY
 
-    /**
-     * 出站凭据：代理模式给 token（App 会用真 Key 去调服务商），否则就是 API Key 本身。
-     *
-     * 参数由调用方从「这一跳到底走不走代理」算出来，**不再自己调 [viaProxy]** ——
-     * 两者必须同一个判断。原来这里自己算，而 `probe()` 的地址是直连的（刻意如此，见 probe），
-     * 于是自检就出现了「连服务商、发代理 token」的组合 → 必然 401，回显的还正是那个随机 token。
-     */
-    private fun authHeader(proxyRoute: Boolean): String =
-        "Bearer " + if (proxyRoute) cfg.proxyToken else cfg.apiKey
+    // 出站凭据的规矩（踩过一次别忘）：**凭据由「这一跳到底走不走代理」决定，不看别的东西**。
+    // 以前这里自己算代理、而 probe 的地址是直连的，于是自检出现了「连服务商、发代理 token」
+    // 的组合 → 必然 401，回显的还正是那个随机 token。现在这个判断只在 once() 里算一次。
+    // 直连时的鉴权头改由**接口形态**给（OpenAI/自定义 = Bearer；Anthropic = x-api-key + 版本头）。
 
     /** 发起前的前置检查。代理模式下**不看 Key** —— 它本来就该是空的（App 根本没推过来）。 */
     private fun requireReady() {
@@ -116,24 +114,22 @@ class LlmClient(
             append("聊天记录（时间顺序，最后一条是对方刚发的）：\n").append(msgs.asTranscript())
             append("\n\n只输出系统要求的那个 JSON 对象，不要任何解释文字。")
         }
-        fun payloadFor(system: String): String {
-            val fields = LinkedHashMap<String, JsonValue>()
-            fields["model"] = str(cfg.model)
-            fields["temperature"] = num(cfg.temperature)
-            // 严格 JSON 输出：让服务端保证返回是合法 JSON。
-            // 只加在「生成候选」这条路上 —— 改写和风格提炼走 complete()，它们本来就要纯文本，
-            // 给它们带 json_object 反而会把返回变成 JSON 字符串。
-            if (cfg.jsonMode) fields["response_format"] = obj("type" to str("json_object"))
-            // 0 = 无限制：干脆不传这个参数，交给服务端默认
-            if (cfg.maxTokens > 0) fields["max_tokens"] = num(cfg.maxTokens)
-            fields["messages"] = arr(
-                listOf(
-                    obj("role" to str("system"), "content" to str(system)),
-                    obj("role" to str("user"), "content" to str(userText)),
-                ),
-            )
-            return Json.encode(JsonValue.Obj(fields))
-        }
+        // 请求体与鉴权头交给「接口形态」去组装（llm/ApiShape.kt）：
+        // 形态差异只有三处 —— URL 路径 / 请求体 / 鉴权头，所以这里不再自己拼。
+        // 严格 JSON 输出只加在「生成候选」这条路上（jsonMode）—— 改写和风格提炼走 complete()，
+        // 它们本来就要纯文本，带上 json_object 反而会把返回变成 JSON 字符串。
+        fun requestFor(system: String): ApiRequest = buildApiRequest(
+            shape = shape,
+            base = cfg.baseUrl,
+            customPath = cfg.customPath,
+            apiKey = cfg.apiKey,
+            model = cfg.model,
+            system = system,
+            user = userText,
+            temperature = cfg.temperature,
+            maxTokens = cfg.maxTokens,
+            jsonMode = cfg.jsonMode,
+        )
 
         // 最多两次：第一次正常发；如果**模型没按契约回**（不是合法 JSON / 被截断），
         // 补一句「严格只输出 JSON」再试一次 —— 比让用户自己去点「重新识别」强。
@@ -143,11 +139,16 @@ class LlmClient(
         while (true) {
             val system = if (attempt == 0) systemText else systemText + "\n\n" + JSON_NUDGE
             try {
-                val root = parseResponse(post(outboundUrl(), payloadFor(system)))
-                val content = root.at("choices", "0", "message", "content").asStr()
-                    ?: throw LlmException("返回里没有 choices[0].message.content", "确认模型名是否可用、该接口是否兼容 OpenAI 格式")
+                val req = requestFor(system)
+                val root = parseResponse(post(outboundUrl(req.url), req.body, authHeaders = req.authHeaders))
+                val reply = parseApiReply(shape, root)
+                    ?: throw LlmException(
+                        "返回里没有正文（${shape.label}）",
+                        "确认模型名是否可用、以及这个服务商是否真的支持所选的接口形态",
+                    )
+                val content = reply.content
                 trace(system, userText, content)
-                tokensTotal += root.at("usage", "total_tokens").asInt() ?: 0
+                tokensTotal += reply.tokens
                 val parsed = try {
                     SuggestionParser.parse(content, requireReplies)
                 } catch (e: LlmException) {
@@ -162,7 +163,7 @@ class LlmClient(
                     suggestion = parsed,
                     totalTokens = tokensTotal,
                     millis = System.currentTimeMillis() - start,
-                    model = root.at("model").asStr() ?: cfg.model,
+                    model = reply.model.ifBlank { cfg.model },
                 )
             } catch (t: Throwable) {
                 trace(system, userText, "（请求失败）${t.message}")
@@ -179,21 +180,27 @@ class LlmClient(
      */
     fun complete(systemText: String, userText: String): Pair<String, Int> {
         requireReady()
-        val fields = LinkedHashMap<String, JsonValue>()
-        fields["model"] = str(cfg.model)
-        // 提炼风格不需要发散：温度压低，免得每次结果跳来跳去
-        fields["temperature"] = num(0.3)
-        if (cfg.maxTokens > 0) fields["max_tokens"] = num(cfg.maxTokens)
-        fields["messages"] = arr(
-            listOf(
-                obj("role" to str("system"), "content" to str(systemText)),
-                obj("role" to str("user"), "content" to str(userText)),
-            ),
+        // 提炼风格 / 单条改写不需要发散：温度压低，免得每次结果跳来跳去。
+        // 明确不带 jsonMode：这里要的就是纯文本。
+        val req = buildApiRequest(
+            shape = shape,
+            base = cfg.baseUrl,
+            customPath = cfg.customPath,
+            apiKey = cfg.apiKey,
+            model = cfg.model,
+            system = systemText,
+            user = userText,
+            temperature = 0.3,
+            maxTokens = cfg.maxTokens,
+            jsonMode = false,
         )
-        val root = parseResponse(post(outboundUrl(), Json.encode(JsonValue.Obj(fields))))
-        val content = root.at("choices", "0", "message", "content").asStr()
-            ?: throw LlmException("返回里没有 choices[0].message.content", "确认模型名是否可用、该接口是否兼容 OpenAI 格式")
-        return content to (root.at("usage", "total_tokens").asInt() ?: 0)
+        val root = parseResponse(post(outboundUrl(req.url), req.body, authHeaders = req.authHeaders))
+        val reply = parseApiReply(shape, root)
+            ?: throw LlmException(
+                "返回里没有正文（${shape.label}）",
+                "确认模型名是否可用、以及这个服务商是否真的支持所选的接口形态",
+            )
+        return reply.content to reply.tokens
     }
 
     /**
@@ -244,7 +251,21 @@ class LlmClient(
         // 自检永远是直连的（地址见下），所以这里要的就是**真 Key** ——
         // 代理模式下 `proxyToken` 不是凭据，拿它去连服务商只会换回一个 401。
         if (cfg.apiKey.isBlank()) throw LlmException("还没填 API Key", "到「设置 → 高级设置」里填地址和 Key")
-        val url = endpoint(cfg.baseUrl)
+        // 自检也按**当前形态**发：否则选了 Anthropic 的人会看到「接口 404」，
+        // 其实只是形态没对上（跟模型听不听话一点关系都没有）。
+        val probeReq = buildApiRequest(
+            shape = shape,
+            base = cfg.baseUrl,
+            customPath = cfg.customPath,
+            apiKey = cfg.apiKey,
+            model = cfg.model,
+            system = "",
+            user = "ping",
+            temperature = 0.0,
+            maxTokens = 1,
+            jsonMode = false,
+        )
+        val url = probeReq.url
         val host = NetInfo.hostOf(url)
 
         // ① DNS 解析耗时（顺便拿到目标 IP）
@@ -256,27 +277,19 @@ class LlmClient(
         val connectMs = NetInfo.tcpConnectMs(host, NetInfo.portOf(url))
 
         // ③ 一次最小往返
-        val payload = Json.encode(
-            obj(
-                "model" to str(cfg.model),
-                "max_tokens" to num(1),
-                "messages" to arr(
-                    listOf(obj("role" to str("user"), "content" to str("ping"))),
-                ),
-            ),
-        )
         val start = System.currentTimeMillis()
         // direct = true：自检量的是**真实目标机**的 DNS/TCP 延迟，走回环就变成量 127.0.0.1，没意义。
         // 「代理通不通」由代理卡片那行「微信侧最近一次走的是：本地代理 ✅」负责。
-        val root = parseResponse(post(url, payload, direct = true))
+        val root = parseResponse(post(url, probeReq.body, direct = true, authHeaders = probeReq.authHeaders))
         return ProbeResult(
             host = host,
             targetIp = targetIp,
             dnsMs = dnsMs,
             connectMs = connectMs,
             totalMs = System.currentTimeMillis() - start,
-            model = root.at("model").asStr() ?: cfg.model,
-            totalTokens = root.at("usage", "total_tokens").asInt() ?: 0,
+            // 自检**不要求正文**（只要 2xx 且是 JSON 就算通），所以取不到就给兜底值
+            model = parseApiReply(shape, root)?.model?.ifBlank { cfg.model } ?: cfg.model,
+            totalTokens = parseApiReply(shape, root)?.tokens ?: 0,
         )
     }
 
@@ -287,21 +300,21 @@ class LlmClient(
         root
     }
 
-    private fun endpoint(base: String): String {
-        if (base.isBlank()) throw LlmException("接口地址是空的", "示例：https://api.openai.com/v1")
-        return chatCompletionsUrl(base)
-    }
-
     /**
      * 失败重试一次（只对超时/5xx/429 这种「可能只是碰巧」的错误）。
      *
      * @param direct 这一跳**强制直连**、不走本地代理（自检用）。
      */
-    private fun post(url: String, payload: String, direct: Boolean = false): String {
+    private fun post(
+        url: String,
+        payload: String,
+        direct: Boolean = false,
+        authHeaders: Map<String, String> = emptyMap(),
+    ): String {
         var last: LlmException? = null
         for (attempt in 0..1) {
             try {
-                return once(url, payload, direct)
+                return once(url, payload, direct, authHeaders)
             } catch (e: LlmException) {
                 last = e
                 if (!e.retryable || attempt == 1) break
@@ -316,7 +329,12 @@ class LlmClient(
         throw last ?: LlmException("请求失败", null)
     }
 
-    private fun once(url: String, payload: String, direct: Boolean = false): String {
+    private fun once(
+        url: String,
+        payload: String,
+        direct: Boolean = false,
+        authHeaders: Map<String, String> = emptyMap(),
+    ): String {
         val conn = try {
             URL(url).openConnection() as HttpURLConnection
         } catch (t: Throwable) {
@@ -331,10 +349,17 @@ class LlmClient(
             conn.setRequestProperty("Accept", "application/json")
             // 「走不走代理」在这里只算一次，凭据和接口头都用它 —— 两者分开判断过一次，出了 401
             val proxyRoute = !direct && viaProxy()
-            conn.setRequestProperty("Authorization", authHeader(proxyRoute))
-            // 代理那侧认不出「这一跳是谁」，得靠这个头告诉它用哪套接口（只对代理有意义）
             if (proxyRoute) {
+                // 代理模式：凭据是**回环 token**（真 Key 在 App 进程那边）。
+                // ⚠️ 代理只转发 OpenAI 兼容形态 —— 选了 Responses / Anthropic 还开着代理时，
+                // 界面上会提示把代理关掉（见 ApiShape.usableThroughProxy）。
+                conn.setRequestProperty("Authorization", "Bearer ${cfg.proxyToken}")
+                // 代理那侧认不出「这一跳是谁」，得靠这个头告诉它用哪套接口（只对代理有意义）
                 conn.setRequestProperty(ProxyProtocol.HEADER_ENDPOINT, ProxyProtocol.endpointHeader(second))
+            } else {
+                // 直连：鉴权头由**接口形态**决定（OpenAI / 自定义 = Bearer；Anthropic = x-api-key + 版本头）
+                authHeaders.forEach { (k, v) -> conn.setRequestProperty(k, v) }
+                if (authHeaders.isEmpty()) conn.setRequestProperty("Authorization", "Bearer ${cfg.apiKey}")
             }
             conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
 

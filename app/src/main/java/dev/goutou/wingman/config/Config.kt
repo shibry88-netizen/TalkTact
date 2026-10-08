@@ -25,6 +25,12 @@ object Keys {
     const val BASE = "base_url"
     const val KEY = "api_key"
     const val MODEL = "model"
+    /** 接口形态：openai / responses / anthropic / custom（见 llm/ApiShape.kt） */
+    const val API_SHAPE = "api_shape"
+    /** 「自定义路径」形态时的路径（留空 = 地址本身就是完整端点） */
+    const val CUSTOM_PATH = "custom_path"
+    /** 在「服务商」下拉里选过谁（只用于回显 + 显示那家的注意事项，不影响请求） */
+    const val PROVIDER = "provider_preset"
     const val PROMPT = "prompt_v3"
     const val ENABLED = "enabled"
     const val CTX = "ctx"
@@ -146,6 +152,12 @@ data class ConfigData(
     val baseUrl: String = DEFAULT_BASE,
     val apiKey: String = "",
     val model: String = DEFAULT_MODEL,
+    /** 接口形态 id（见 llm/ApiShape.kt）。老配置没有这个键 → 默认 OpenAI 兼容。 */
+    val apiShape: String = "openai",
+    /** 「自定义路径」形态时的路径 */
+    val customPath: String = "",
+    /** 在「服务商」下拉里选过谁（只用于回显） */
+    val provider: String = "",
     val prompt: String = DEFAULT_PROMPT,
     val enabled: Boolean = true,
     /** 参考最近几条消息（2..20） */
@@ -273,6 +285,9 @@ data class ConfigData(
             baseUrl = p.getString(Keys.BASE, DEFAULT_BASE).orEmpty().ifBlank { DEFAULT_BASE },
             apiKey = p.getString(Keys.KEY, "").orEmpty(),
             model = p.getString(Keys.MODEL, DEFAULT_MODEL).orEmpty().ifBlank { DEFAULT_MODEL },
+            apiShape = p.getString(Keys.API_SHAPE, "openai").orEmpty().ifBlank { "openai" },
+            customPath = p.getString(Keys.CUSTOM_PATH, "").orEmpty(),
+            provider = p.getString(Keys.PROVIDER, "").orEmpty(),
             prompt = p.getString(Keys.PROMPT, null).orEmpty().ifBlank { DEFAULT_PROMPT },
             enabled = p.getBoolean(Keys.ENABLED, true),
             ctx = p.getInt(Keys.CTX, 8).coerceIn(2, 20),
@@ -338,6 +353,9 @@ class ConfigStore(context: Context) {
             .putString(Keys.BASE, d.baseUrl.trim())
             .putString(Keys.KEY, d.apiKey.trim())
             .putString(Keys.MODEL, d.model.trim())
+            .putString(Keys.API_SHAPE, d.apiShape)
+            .putString(Keys.CUSTOM_PATH, d.customPath)
+            .putString(Keys.PROVIDER, d.provider)
             .putString(Keys.PROMPT, d.prompt)
             .putBoolean(Keys.ENABLED, d.enabled)
             .putInt(Keys.CTX, d.ctx)

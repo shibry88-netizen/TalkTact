@@ -64,6 +64,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import dev.goutou.wingman.llm.ApiShape
+import dev.goutou.wingman.llm.PROVIDER_PRESETS
+import dev.goutou.wingman.llm.presetOf
+import dev.goutou.wingman.llm.shapeOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -1672,6 +1676,99 @@ fun AdvancedScreen(
             Spacer(Modifier.height(10.dp))
             Text("接口地址", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = palette.text)
             Spacer(Modifier.height(8.dp))
+
+            // 服务商预设：**只省掉「去官网查地址」这一步**。选中后地址 / 模型照样能手改，
+            // 也不改变任何请求逻辑 —— 我们本来就是「OpenAI 兼容 + 自定义 base_url + 自定义 model」。
+            val chosenPreset = presetOf(d.provider)
+            var providerOpen by remember { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("服务商", fontSize = 13.sp, color = palette.sub, modifier = Modifier.weight(1f))
+                Box {
+                    OutlinedButton(
+                        onClick = { providerOpen = true },
+                        shape = RoundedCornerShape(RadiusR1),
+                    ) { Text(chosenPreset?.label ?: "自定义（自己填）", fontSize = 13.sp) }
+                    DropdownMenu(expanded = providerOpen, onDismissRequest = { providerOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("自定义（自己填）", fontSize = 13.sp) },
+                            onClick = {
+                                providerOpen = false
+                                update(d.copy(provider = ""))
+                            },
+                        )
+                        PROVIDER_PRESETS.forEach { p ->
+                            DropdownMenuItem(
+                                text = { Text(p.label, fontSize = 13.sp) },
+                                onClick = {
+                                    providerOpen = false
+                                    // 选预设 = 把「地址 / 形态 / 模型（有才填）」写进草稿，仍然可改
+                                    update(
+                                        d.copy(
+                                            provider = p.id,
+                                            baseUrl = p.baseUrl,
+                                            apiShape = p.shape.id,
+                                            model = p.model.ifBlank { d.model },
+                                        ),
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            chosenPreset?.note?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(it, fontSize = 13.sp, color = palette.sub)
+            }
+            Spacer(Modifier.height(10.dp))
+
+            // 接口形态：差异只有 URL 路径 / 请求体 / 鉴权头三处（见 llm/ApiShape.kt）。
+            val shapeNow = shapeOf(d.apiShape)
+            var shapeOpen by remember { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("接口形态", fontSize = 13.sp, color = palette.sub, modifier = Modifier.weight(1f))
+                Box {
+                    OutlinedButton(
+                        onClick = { shapeOpen = true },
+                        shape = RoundedCornerShape(RadiusR1),
+                    ) { Text(shapeNow.label, fontSize = 13.sp) }
+                    DropdownMenu(expanded = shapeOpen, onDismissRequest = { shapeOpen = false }) {
+                        ApiShape.values().forEach { s ->
+                            DropdownMenuItem(
+                                text = { Text(s.label, fontSize = 13.sp) },
+                                onClick = {
+                                    shapeOpen = false
+                                    update(d.copy(apiShape = s.id))
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            Text(shapeNow.note, fontSize = 13.sp, color = palette.sub)
+            if (d.proxyEnabled && !shapeNow.usableThroughProxy) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "⚠ 本地代理只转发 OpenAI 兼容形态：「${shapeNow.label}」请直连 —— " +
+                        "到下面把「本地代理」关掉，或者把形态换回 OpenAI 兼容。",
+                    fontSize = 13.sp,
+                    color = palette.warn,
+                )
+            }
+            if (shapeNow == ApiShape.CUSTOM) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    colors = glassFieldColors(),
+                    shape = RoundedCornerShape(RadiusR2),
+                    value = d.customPath,
+                    onValueChange = { update(d.copy(customPath = it)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("路径（留空 = 这个地址本身就是完整端点）") },
+                    singleLine = true,
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+
             OutlinedTextField(
                 colors = glassFieldColors(),
                 shape = RoundedCornerShape(RadiusR2),
