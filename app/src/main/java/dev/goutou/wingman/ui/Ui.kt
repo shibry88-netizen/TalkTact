@@ -144,6 +144,8 @@ val RadiusR4 = 32.dp   // 顶部大面板 / 底部面板顶角
  */
 val StatusDotSize = 8.dp
 /** chip / 小标签的底色透明度（状态色或选中色 + 这一层 alpha 铺在玻璃上）。 */
+/** 低配档的描边透明度（设计师 P2）：那一档没有模糊 / 折射衬托，bevel 梯度读不出来，改用均匀描边。 */
+const val LOW_TIER_EDGE_ALPHA = 0.16f
 const val ChipBgAlpha = 0.14f
 /** 状态色 / 选中色的 1dp 描边透明度（批 4c 之前是 0.45 / 0.5 / 0.55 三档混用）。 */
 const val CardBorderAlpha = 0.35f
@@ -570,6 +572,12 @@ internal fun DrawScope.drawBackdropArt(
     w: Float,
     h: Float,
     quality: GlassQuality = GlassQuality.HIGH,
+    /**
+     * 0..1 的动画相位：只用来让左上角那团光晕**缓慢漂移**（设计师 P2：动效按档启用）。
+     * 默认 0 = 完全静止 —— 中/低档位、截图回归（`ScreenRenderTest`）以及面板里那份背景副本
+     * 都走这个默认值，所以测试与低配机不会因为动画而抖动。
+     */
+    drift: Float = 0f,
 ) {
     // ① 底色渐变（斜向）：永远画。图还没解码完、或者用户选了张很亮的图时，兜住文字对比度。
     drawRect(
@@ -603,12 +611,15 @@ internal fun DrawScope.drawBackdropArt(
         return
     }
 
-    // ② 左上角光晕 —— 整块背景的光源
+    // ② 左上角光晕 —— 整块背景的光源。
+    //    动效按档启用（设计师 P2）：只有**最高档位**才让它漂移，幅度很小（±3% 宽 / ±2% 高）——
+    //    是「呼吸」，不是「晃」。中/低档与截图回归传 drift = 0，完全静止。
     if (b.bgGlowAlpha > 0f) {
+        val swing = if (quality == GlassQuality.HIGH) (drift * 2f - 1f) else 0f
         drawRect(
             brush = Brush.radialGradient(
                 colors = listOf(b.bgGlow.copy(alpha = b.bgGlowAlpha), Color.Transparent),
-                center = Offset(w * 0.72f, h * 0.12f),
+                center = Offset(w * 0.72f + swing * w * 0.03f, h * 0.12f + swing * h * 0.02f),
                 // 半径 0.9W：光晕要「铺得开」才给玻璃一点可透的明暗起伏（原来 1.10W 太平）
                 radius = max(w * 0.90f, h * 0.45f),
             ),
@@ -727,7 +738,7 @@ fun BackgroundLayer(backdrop: Backdrop) {
             .drawBehind {
                 val w = if (root.width > 0) root.width.toFloat() else size.width
                 val h = if (root.height > 0) root.height.toFloat() else size.height
-                drawBackdropArt(backdrop, w, h, quality)
+                drawBackdropArt(backdrop, w, h, quality, drift = phase.phase)
             },
     )
 }
@@ -806,7 +817,10 @@ fun GlassSurface(
     // L2（卡内子块）自己传 tintTop/tintBottom，沿用白色染色（且调用方已经乘过 glassAlpha）；
     // L1 主面板走新的紫灰填充，并按 fillAlpha 的公式随「玻璃强度」微调。
     val l2 = tintTop != null || tintBottom != null
-    val boost = if (big) 0.08f else 0f
+    // 低配档补偿（设计师 P2）：低档不模糊、不折射、不扫光，只剩一层染色，卡片会读成「薄」。
+    // 补偿三件事 —— 填充 +0.04、描边固定 0.16、去掉投影（最后一件在 [GlassCard] 里）。
+    val lowComp = quality == GlassQuality.LOW
+    val boost = (if (big) 0.08f else 0f) + (if (lowComp && !l2) 0.04f else 0f)
     val top = if (l2) (tintTop ?: palette.glassFillTopAlpha) else fillAlpha(palette.glassFillTopAlpha + boost, glassAlpha)
     val bottom = if (l2) (tintBottom ?: palette.glassFillBottomAlpha) else fillAlpha(palette.glassFillBottomAlpha + boost, glassAlpha)
     val fillTop = if (l2) palette.glassTint else palette.glassFillTop
@@ -925,6 +939,10 @@ fun GlassSurface(
                     width = 1.dp,
                     brush = if (borderColor != null) {
                         SolidColor(borderColor)
+                    } else if (lowComp) {
+                        // 低配档：没有模糊 / 折射衬托，「左上亮、右下暗」这套斜面 bevel 根本读不出来 ——
+                        // 换成一条**均匀**的 0.16 描边（设计师 P2 给的数值）。它是这一档唯一的「厚度」凭据。
+                        SolidColor(Color.White.copy(alpha = LOW_TIER_EDGE_ALPHA))
                     } else {
                         Brush.linearGradient(
                             0f to palette.glassEdgeHi.copy(alpha = edgeAlpha(palette.glassEdgeHiAlpha, glassAlpha)),
@@ -950,6 +968,7 @@ fun GlassCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val palette = LocalPalette.current
+    val quality = LocalGlassQuality.current
     val cardShape = RoundedCornerShape(RadiusR3)
     GlassSurface(
         shape = cardShape,
@@ -959,13 +978,21 @@ fun GlassCard(
             .fillMaxWidth()
             .padding(horizontal = 20.dp, vertical = 8.dp)
             // 外投影是「厚度」的一部分：**不乘 glassAlpha**（乘了滑到最低档就像贴在纸上），
-            // 颜色与强度按规范（浅色 y6/blur18 紫 / 深色 y8/blur24 近黑）
-            .shadow(
-                elevation = palette.glassShadowDp.dp,
-                shape = cardShape,
-                clip = false,
-                ambientColor = palette.glassShadow.copy(alpha = palette.glassShadowAlpha),
-                spotColor = palette.glassShadow.copy(alpha = palette.glassShadowAlpha),
+            // 颜色与强度按规范（浅色 y6/blur18 紫 / 深色 y8/blur24 近黑）。
+            // 低配档整层去掉（设计师 P2 的第三件补偿）：弱机上大面积 shadow 也要花钱，
+            // 而那一档本来就靠「填充 + 描边」立住了。
+            .then(
+                if (quality == GlassQuality.LOW) {
+                    Modifier
+                } else {
+                    Modifier.shadow(
+                        elevation = palette.glassShadowDp.dp,
+                        shape = cardShape,
+                        clip = false,
+                        ambientColor = palette.glassShadow.copy(alpha = palette.glassShadowAlpha),
+                        spotColor = palette.glassShadow.copy(alpha = palette.glassShadowAlpha),
+                    )
+                },
             ),
     ) {
         Column(Modifier.padding(20.dp), content = content)
